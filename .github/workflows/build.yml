@@ -33,8 +33,18 @@ jobs:
           fi
           echo "Распаковываю $ARCH"
           unzip -o -q "$ARCH" -d _extracted
-          INNER=$(find _extracted -maxdepth 1 -mindepth 1 -type d | head -1)
-          if [ -n "$INNER" ] && [ -f "$INNER/package.json" ]; then SRC="$INNER"; else SRC=_extracted; fi
+          # ищем package.json; если в архиве лежит вложенный zip проекта (репо-архив целиком) — распаковываем и его
+          SRC=""
+          for pass in 1 2 3; do
+            INNER=$(find _extracted -maxdepth 1 -mindepth 1 -type d ! -name ".github" | head -1)
+            if [ -f _extracted/package.json ]; then SRC=_extracted; break; fi
+            if [ -n "$INNER" ] && [ -f "$INNER/package.json" ]; then SRC="$INNER"; break; fi
+            NZ=$(find _extracted -maxdepth 2 -name '*.zip' | head -1)
+            if [ -z "$NZ" ]; then break; fi
+            echo "Вложенный архив: $NZ — распаковываю"
+            mkdir -p _ex2 && unzip -o -q "$NZ" -d _ex2 && rm -rf _extracted && mv _ex2 _extracted
+          done
+          if [ -z "$SRC" ]; then echo "::error::В архиве нет package.json — не тот архив?"; exit 1; fi
           shopt -s dotglob
           for item in "$SRC"/*; do
             name=$(basename "$item")
@@ -45,7 +55,7 @@ jobs:
           shopt -u dotglob
           rm -rf _extracted
           rm -f "$ARCH"
-          if [ ! -f package.json ]; then echo "::error::В архиве нет package.json — не тот архив?"; exit 1; fi
+          if [ ! -f package.json ]; then echo "::error::package.json не появился после распаковки"; exit 1; fi
           echo "=== корень после распаковки ===" && ls -la
 
       - uses: actions/setup-node@v4
