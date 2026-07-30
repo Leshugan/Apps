@@ -3,10 +3,6 @@ run-name: "🔨 Сборка APK Apps"
 
 on:
   push:
-    branches: [main, master]
-    paths:
-      - '*.zip'
-      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 concurrency:
