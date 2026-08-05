@@ -22,14 +22,15 @@ jobs:
       - name: Распаковать архив проекта в корень
         run: |
           set -e
-          # В корне репозитория лежит только этот workflow + архив проекта (*.zip, имя любое).
-          ARCH=$(ls *.zip 2>/dev/null | head -1)
+          # В корне репозитория лежит только этот workflow + Project_Apps.zip.
+          # Имя допускается любое (*.zip), но Project_Apps.zip имеет приоритет.
+          if [ -f Project_Apps.zip ]; then ARCH=Project_Apps.zip; else ARCH=$(ls *.zip 2>/dev/null | head -1); fi
           if [ -z "$ARCH" ]; then
-            echo "::error::Не найден архив проекта (*.zip) в корне репозитория"; exit 1
+            echo "::error::Не найден архив проекта (Project_Apps.zip) в корне репозитория"; exit 1
           fi
           echo "Распаковываю $ARCH"
           unzip -o -q "$ARCH" -d _extracted
-          # ищем package.json; если в архиве лежит вложенный zip проекта (репо-архив целиком) — распаковываем и его
+          # ищем package.json; если внутри лежит вложенный zip проекта (репо-архив целиком) — распаковываем и его
           SRC=""
           for pass in 1 2 3; do
             INNER=$(find _extracted -maxdepth 1 -mindepth 1 -type d ! -name ".github" | head -1)
@@ -53,6 +54,35 @@ jobs:
           rm -f "$ARCH"
           if [ ! -f package.json ]; then echo "::error::package.json не появился после распаковки"; exit 1; fi
           echo "=== корень после распаковки ===" && ls -la
+
+      - name: Версия и чейнджлог (version.json)
+        run: |
+          set -e
+          # Версия живёт в проекте: version.json {"version":"1.001","release":true,"changelog":[...]}
+          if [ -f version.json ]; then
+            APP_VER=$(node -p "require('./version.json').version || ''")
+            RELEASE=$(node -p "require('./version.json').release === false ? 'false' : 'true'")
+          else
+            APP_VER=$(node -p "require('./package.json').version || ''")
+            RELEASE=true
+          fi
+          [ -z "$APP_VER" ] && APP_VER="1.0"
+          # versionCode = версия*1000, но не ниже 1001 (на устройстве уже стоит 1001, даунгрейд не ставится)
+          APP_CODE=$(awk -v v="$APP_VER" 'BEGIN{printf "%d", v*1000+0.5}')
+          if [ "$APP_CODE" -lt 1001 ]; then APP_CODE=1001; fi
+          # имя APK: релиз — «Apps v1.001.apk», тестовая сборка — «Apps v1.001-test42.apk»
+          if [ "$RELEASE" = "true" ]; then APK_NAME="Apps v${APP_VER}.apk"; else APK_NAME="Apps v${APP_VER}-test${{ github.run_number }}.apk"; fi
+          echo "APP_VER=$APP_VER"   >> "$GITHUB_ENV"
+          echo "APP_CODE=$APP_CODE" >> "$GITHUB_ENV"
+          echo "RELEASE=$RELEASE"   >> "$GITHUB_ENV"
+          echo "APK_NAME=$APK_NAME" >> "$GITHUB_ENV"
+          # сводка запуска: версия и чейнджлог видны прямо в Actions
+          {
+            echo "### Apps v$APP_VER $([ "$RELEASE" = "true" ] && echo '(релиз)' || echo '(тестовая сборка)')"
+            echo ""
+            node -e "try{const c=require('./version.json').changelog||[];c.forEach(l=>console.log('- '+l))}catch(e){}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "версия $APP_VER / code $APP_CODE / файл: $APK_NAME"
 
       - uses: actions/setup-node@v4
         with:
@@ -88,15 +118,9 @@ jobs:
             echo "org.gradle.configureondemand=true"
             echo "org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8"
           } >> android/gradle.properties
-          # версия приложения из package.json: versionName = X.YYY, versionCode = XYYY
-          VER=$(node -p "require('./package.json').version" 2>/dev/null || echo "1.0")
-          VCODE=$(awk -v v="$VER" 'BEGIN{printf "%d", v*1000+0.5}')
-          # на устройстве уже стоит сборка с versionCode 1001 — ниже нельзя (Android не ставит даунгрейд,
-          # а оболочки пишут про «конфликт пакета/подписи»); минимальный код = 1001
-          if [ "$VCODE" -lt 1001 ]; then VCODE=1001; fi
           GRV=android/app/build.gradle
-          sed -i -E "s/versionCode [0-9]+/versionCode $VCODE/" "$GRV"
-          sed -i -E "s/versionName \"[^\"]*\"/versionName \"$VER\"/" "$GRV"
+          sed -i -E "s/versionCode [0-9]+/versionCode $APP_CODE/" "$GRV"
+          sed -i -E "s/versionName \"[^\"]*\"/versionName \"$APP_VER\"/" "$GRV"
           grep -nE "versionCode|versionName" "$GRV" || true
 
       - name: Generate app icons
@@ -129,10 +153,11 @@ jobs:
           set -e
           PKG=android/app/src/main/java/leshugan/ma
           mkdir -p "$PKG" android/app/src/main/res/xml
-          # копируем ВСЕ java из native/ — чтобы новые файлы не приходилось вписывать сюда руками
+          # копируем ВСЕ исходники из native/ — новые файлы не приходится вписывать сюда руками
           for f in native/*.java; do
             cp "$f" "$PKG/$(basename "$f")"
           done
+          cp native/*.kt "$PKG/" 2>/dev/null || true
           cp native/apps_file_paths.xml android/app/src/main/res/xml/apps_file_paths.xml
           # переопределяем пути провайдера Capacitor (.fileprovider) на наши,
           # чтобы шаринг получал доступ к кэшу через уже зарегистрированный провайдер
@@ -152,12 +177,11 @@ jobs:
             -Pandroid.injected.signing.key.alias="uc" \
             -Pandroid.injected.signing.key.password="updatechecker"
 
-      - name: Rename APK to "Apps v.X.YYY"
+      - name: Переименовать APK
         run: |
           set -e
-          VER=$(node -p "require('./package.json').version")
           SRC=$(ls android/app/build/outputs/apk/release/*.apk | head -1)
-          DST="android/app/build/outputs/apk/release/Apps v.$VER.apk"
+          DST="android/app/build/outputs/apk/release/${APK_NAME}"
           if [ -n "$SRC" ] && [ "$SRC" != "$DST" ]; then mv "$SRC" "$DST"; fi
           ls -la android/app/build/outputs/apk/release/
 
@@ -166,7 +190,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: Apps_Compiled
+          name: Apps_APK
           path: android/app/build/outputs/apk/release/*.apk
           retention-days: 5
 
@@ -179,11 +203,11 @@ jobs:
           set -e
           APK=$(ls android/app/build/outputs/apk/release/*.apk | head -1)
           TAG=apk-latest
-          NOTES="Автосборка #${{ github.run_number }} от $(date -u +'%Y-%m-%d %H:%M UTC') — выложено в релиз, т.к. квота артефактов исчерпана."
+          NOTES="Apps v${APP_VER} — автосборка #${{ github.run_number }} от $(date -u +'%Y-%m-%d %H:%M UTC'). Выложено в релиз, т.к. квота артефактов исчерпана."
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release edit "$TAG" --repo "$REPO" --notes "$NOTES"
           else
-            gh release create "$TAG" --repo "$REPO" --title "Apps_Compiled" --notes "$NOTES"
+            gh release create "$TAG" --repo "$REPO" --title "Apps_APK" --notes "$NOTES"
           fi
           gh release upload "$TAG" "$APK" --repo "$REPO" --clobber
           echo "::notice::Квота артефактов исчерпана — APK в релизе $TAG"
